@@ -6,10 +6,14 @@ import collections
 import csv
 import os
 import re
+import time
 import shutil
 import typing
 import zhconv
 from datetime import date, datetime
+from typing import IO
+
+archive_time = "2023-01-01 00:00:00"  # any questionnaire submitted before this will be archived
 
 questionnaire = [
     '宿舍是上床下桌吗？',
@@ -43,13 +47,28 @@ NAME_PREPROCESS = re.compile(r'[\(\)（）【】#]')
 FILENAME_PREPROCESS = re.compile(r'[/>|:&]')
 NORMAL_NAME_MATCHER = re.compile(r'大学|学院|学校')
 
+
+# store answer id and content
+class IndexedContent:
+    answer_id: int
+    content: str
+
+    def __init__(self, answer_id: int, content: str):
+        self.answer_id = answer_id
+        self.content = content
+
+    def __str__(self):
+        # print answer correctly when concatenating with str
+        return f'A{self.answer_id}: {self.content}'
+
+
 class AnswerGroup:
     answers: list
 
     def __init__(self):
         self.answers = []
 
-    def add_answer(self, answer: str):
+    def add_answer(self, answer: IndexedContent):
         self.answers.append(answer)
 
     def extend(self, other):
@@ -66,13 +85,13 @@ class University:
         self.additional_answers = []
         self.credits = []
 
-    def add_answer(self, index: int, answer: str):
+    def add_answer(self, index: int, answer: IndexedContent):
         self.answers[index].add_answer(answer)
 
-    def add_additional_answer(self, answer: str):
+    def add_additional_answer(self, answer: IndexedContent):
         self.additional_answers.append(answer)
 
-    def add_credit(self, author: str):
+    def add_credit(self, author: IndexedContent):
         self.credits.append(author)
 
     def combine_from(self, other):
@@ -118,9 +137,11 @@ def join_path(*paths):
     return '/'.join(paths)
 
 
-def generate_markdown_path(name: str, in_readme: bool):
+def generate_markdown_path(name: str, in_readme: bool, archived: bool):
     paths = [ 'universities', name ]
-    if in_readme:
+    if archived and not in_readme:
+        paths = ['archived'] + paths
+    if in_readme and not archived:
         paths = ['.', 'docs'] + paths
     return join_path(*paths) + '.md'
 
@@ -143,50 +164,41 @@ def load_colleges():
     return provinces, colleges  
 
 
-def main():
-    provinces, colleges = load_colleges()
-    
-    # ===== read from csv =====
-    with open('results_desensitized.csv', 'r', encoding='gb18030') as f:
-        csv_reader = csv.reader(f)
-        next(csv_reader)  # here we skip the first line
+def load_to_universities(universities: dict, row: list):
+    # unpack row into different parts, and ignore 9 items in the end.
+    # `anonymous`: `2` means anonymous, and `1` not.
+    # if `anonymous` is True, `email` is empty.
+    aid, _, anonymous, email, show_email, name, *answers = row[:-9]
+    # if int(id) == 3516:
+    #     continue
 
-        universities = collections.defaultdict(University)
-        filename_map = FilenameMap()  # university name => filename
+    additional_answer = IndexedContent(aid, row[-9])
 
-        for row in csv_reader:
-            # unpack row into different parts, and ignore 7 items in the end.
-            # `anonymous`: `2` means anonymous, and `1` not.
-            # if `anonymous` is True, `email` is empty.
-            id, _, anonymous, email, show_email, name, *answers = row[:-9]
-            # if int(id) == 3516:
-            #     continue
+    # convert `anonymous` and `show_email` to boolean
+    anonymous = True if int(anonymous) == 2 else False
+    show_email = True if (not anonymous and float(show_email) == 1.0) else False
 
-            additional_answer = row[-9]
+    # preprocess name
+    name = zhconv.convert(name, 'zh-cn')
+    name = NAME_PREPROCESS.sub('', name).strip()
 
-            # convert `anonymous` and `show_email` to boolean
-            anonymous = True if int(anonymous) == 2 else False
-            show_email = True if (not anonymous and float(show_email) == 1.0) else False
+    # if not exists, defaultdict will help create one
+    university = universities[name]
 
-            # preprocess name
-            name = zhconv.convert(name, 'zh-cn')
-            name = NAME_PREPROCESS.sub('', name).strip()
+    # process questionnaire submittal time
+    submittal_time = datetime.strptime(row[-8], '%Y-%m-%d %H:%M:%S')
 
-            # if not exists, defaultdict will help create one
-            university = universities[name]
+    if not show_email or email == '':
+        university.add_credit(IndexedContent(aid, '匿名 (' + submittal_time.strftime('%Y 年 %m 月') + ')'))
+    else:
+        university.add_credit(IndexedContent(aid, email + ' (' + submittal_time.strftime('%Y 年 %m 月') + ')'))
 
-            # process questionnaire submittal time
-            submittal_time = datetime.strptime(row[-8], '%Y-%m-%d %H:%M:%S')
+    for index, answer in enumerate(answers):
+        university.add_answer(index, IndexedContent(aid, answer))
+    university.add_additional_answer(additional_answer)
 
-            if not show_email or email == '':
-                university.add_credit('匿名 (' + submittal_time.strftime('%Y 年 %m 月') + ')')
-            else:
-                university.add_credit(email + ' (' + submittal_time.strftime('%Y 年 %m 月') + ')')
 
-            for index, answer in enumerate(answers):
-                university.add_answer(index, answer)
-            university.add_additional_answer(additional_answer)
-
+def process_universities(universities: dict, colleges: dict):
     # ===== combine colleges =====
     with open('alias.txt', 'r', encoding='utf-8') as f:
         for line in f:
@@ -203,6 +215,14 @@ def main():
             name = line.rstrip('\n')
             if name in universities:
                 del universities[name]
+                
+    middle_school_names = []
+    for name in universities:
+        if (name.endswith('中') or '中学' in name or name.endswith('高') or name.endswith('实验')) and name not in colleges:
+            middle_school_names.append(name)
+    for name in middle_school_names:
+        print(f'[info] \033[0;36m{name}\033[0m is removed')
+        del universities[name]
     
     whitelist = set()
     with open('whitelist.txt', 'r', encoding='utf-8') as f:
@@ -215,54 +235,57 @@ def main():
             if not name in whitelist:
                 print(f'[warning] \033[0;36m{name}\033[0m may be invalid')
 
-    # ===== write results =====
-    if os.path.exists(join_path('dist', '.git')):
-        shutil.move(join_path('dist', '.git'), 'dist.git')
-    shutil.rmtree('dist', ignore_errors=True)
-    shutil.copytree('site', 'dist')
-    if os.path.exists('dist.git'):
-        shutil.move('dist.git', join_path('dist', '.git'))
-    os.makedirs(join_path('dist', 'docs', 'universities'), exist_ok=True)
 
+def write_to_markdown(universities: dict, filename_map: FilenameMap, archived: bool):
     for name, university in universities.items():
-        filename = generate_markdown_path(filename_map[name], False)
-        with open(join_path('dist', 'docs', filename), 'w', encoding='utf-8') as f:
+        filename = generate_markdown_path(filename_map[name], False, archived)
+        if archived:
+            name += ' (已归档)'
+        folder_name = join_path('dist', 'docs')
+        with open(join_path(folder_name, filename), 'w', encoding='utf-8') as f:
             # write header
             f.write(f'# {name}\n\n')
             f.write('> [免责声明](https://colleges.chat/#_3)：本页面内容均来源于问卷收集，仅供参考，请自行确定信息准确性和真实性！\n\n')
-            # f.write('> 数据来源：{}\n\n'.format(' + '.join(university.credits)))
-            output_credits = '> 数据来源：'
-            for index, credit in enumerate(university.credits, start=1):
-                output_credits += f'A{index}: {credit} + '
-            f.write(output_credits[:-3] + '\n\n')
+            f.write('> 若您发现回答中存在答非所问或胡言乱语，欢迎记录对应的问卷 ID，前往页面对应的 GitHub 页面，通过 issue 或邮件等方式提交反馈！\n\n')
+            output_credits = '> 数据来源：\n\n<details><summary>点击展开</summary>\n<ul>\n'
+            for credit in university.credits:
+                output_credits += f'<li>A{credit.answer_id}: {credit.content}</li>\n'
+            f.write(output_credits + '</ul>\n</details>\n\n')
 
             # write answers
             assert len(questionnaire) == len(university.answers)
             for question, answers in zip(questionnaire, university.answers):
                 f.write(f'## Q: {question}\n\n')
-                for index, answer in enumerate(answers.answers, start=1):
-                    f.write(f'- A{index}: {markdown_escape(answer)}\n\n')
+                for answer in answers.answers:
+                    f.write(f'- A{answer.answer_id}: {markdown_escape(answer.content)}\n\n')
 
             # write additional answers
-            additional_answers = [ markdown_escape(text).replace('\n', '\n\n') for text in university.additional_answers if len(text) > 0 ]
+            additional_answers = [markdown_escape(answer.__str__()).replace('\n', '\n\n')
+                                   for answer in university.additional_answers if len(answer.content) > 0]
             if len(additional_answers) > 0:
                 f.write('## 自由补充部分\n\n')
                 f.write('\n\n***\n\n'.join(additional_answers))
 
-    with open(join_path('dist', 'README.md'), 'w', encoding='utf-8') as readme_f,\
-         open('README_template.md', 'r', encoding='utf-8') as template_f,\
-         open(join_path('dist', 'nav.txt'), 'w', encoding='utf-8') as nav_f:
+
+def write_to_readme(universities: dict, filename_map: FilenameMap, readme_file_name: str, readme_template_name: str, nav_file_name: str, provinces: dict, colleges: dict, archived=False):  
+    with open(readme_file_name, 'w', encoding='utf-8') as readme_file,\
+         open(readme_template_name, 'r', encoding='utf-8') as template_file,\
+         open(nav_file_name, 'w', encoding='utf-8') as nav_file:
 
         # first, copy template
-        template = template_f.read()
-        readme_f.write(template)
-        readme_f.write('\n\n')
+        template = template_file.read()
+        readme_file.write(template)
+        readme_file.write('\n\n')
 
-        # then, write university links
+        # write university links
+        suffix = ''
+        if archived:
+            suffix = ' (已归档)'
         university_names = list(universities.keys())
         university_names.sort()
-        university_links = [ '[{}]({})'.format(name, generate_markdown_path(filename_map[name], True)) for name in university_names ]
-        readme_f.write('\n\n'.join(university_links))
+        # here `in_readme` should be opposite from `archived` to avoid generating redundant 'docs' for archived
+        university_links = [ '[{}]({})'.format(name + suffix, generate_markdown_path(filename_map[name], not archived, False)) for name in university_names ]
+        readme_file.write('\n\n'.join(university_links))
 
         sorted_colleges_keys = sorted(colleges.keys())
 
@@ -276,25 +299,72 @@ def main():
                     last_pos = current_pos
             provinces[belong_province].append(name)
 
-        for province, colleges in provinces.items():
-            nav_f.write(f'    - {province}:\n')
-            colleges.sort()
-            for name in colleges:
-                nav_f.write('      - {}: {}\n'.format(name, generate_markdown_path(filename_map[name], False)))
-
         # and, write renamed colleges
-        readme_f.write('\n\n### 更名的大学\n\n')
+        readme_file.write('\n\n### 更名的大学\n\n')
         with open('history.txt', 'r', encoding='utf-8') as f:
             for history in f:
                 name, *originals = history.rstrip('\n').split('⬅')
                 for original in originals:
-                    readme_f.write('{} → [{}]({})\n\n'.format(original, name, generate_markdown_path(filename_map[name], True)))
+                    readme_file.write('{} → [{}]({})\n\n'.format(original, name, generate_markdown_path(filename_map[name], True, archived)))
 
+        for province, college in provinces.items():
+            nav_file.write(f'    - {province}:\n')
+            college.sort()
+            for name in college:
+                nav_file.write('      - {}: {}\n'.format(name + suffix, generate_markdown_path(filename_map[name], False, archived)))
+
+
+def main():
+    provinces, colleges = load_colleges()
+    provinces_archived, colleges_archived = load_colleges()
+    
+    archive_date = datetime.strptime(archive_time, '%Y-%m-%d %H:%M:%S')
+
+    # ===== read from csv =====
+    with open('results_desensitized.csv', 'r', encoding='gb18030') as f:
+        csv_reader = csv.reader(f)
+        next(csv_reader)  # here we skip the first line
+
+        universities = collections.defaultdict(University)
+        universities_archived = collections.defaultdict(University)
+        filename_map = FilenameMap()  # university name => filename
+        filename_map_archived = FilenameMap()
+
+        for row in csv_reader:
+            submittal_time = datetime.strptime(row[-8], '%Y-%m-%d %H:%M:%S')
+            # if `submittal_time` is before `archive_date`, save it to archive dict
+            if submittal_time < archive_date:
+                load_to_universities(universities_archived, row)
+            else:
+                load_to_universities(universities, row)
+
+    process_universities(universities, colleges)
+    process_universities(universities_archived, colleges)
+
+    # ===== write results =====
+    if os.path.exists(join_path('dist', '.git')):
+        shutil.move(join_path('dist', '.git'), 'dist.git')
+    shutil.rmtree('dist', ignore_errors=True)
+    shutil.copytree('site', 'dist')
+    if os.path.exists('dist.git'):
+        shutil.move('dist.git', join_path('dist', '.git'))
+    os.makedirs(join_path('dist', 'docs', 'universities'), exist_ok=True)
+    os.makedirs(join_path('dist', 'docs', 'archived', 'universities'), exist_ok=True)
+
+    write_to_markdown(universities, filename_map, False)
+    write_to_markdown(universities_archived, filename_map_archived, True)
+
+    # write README.md and nav file
+    write_to_readme(universities, filename_map, join_path('dist', 'README.md'), 'README_template.md', join_path('dist', 'nav.txt'), provinces, colleges)
+    write_to_readme(universities_archived, filename_map_archived, join_path('dist', 'docs', 'archived', 'README.md'), 'README_archived_template.md', join_path('dist', 'docs', 'archived', 'nav.txt'), provinces_archived, colleges_archived, archived=True)
+
+    # TODO: add archive to mkdocs
     with open(join_path('dist', 'nav.txt'), 'r', encoding='utf-8') as nav_f,\
+         open(join_path('dist', 'docs', 'archived', 'nav.txt'), 'r', encoding='utf-8') as nav_archived_f,\
          open('mkdocs_template.yml', 'r', encoding='utf-8') as mkdocs_template_f,\
          open(join_path('dist', 'mkdocs.yml'), 'w', encoding='utf-8') as mkdocs_f:
         
-        mkdocs_f.write(mkdocs_template_f.read().replace('[universities_nav]',nav_f.read()))
+        mkdocs_f.write(mkdocs_template_f.read().replace('[universities_nav]',nav_f.read()).replace('[universities_nav_archived]',nav_archived_f.read()).replace('[current_time]',time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
 
 if __name__ == '__main__':
     main()
